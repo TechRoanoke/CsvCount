@@ -8,39 +8,90 @@ using System.Threading.Tasks;
 
 namespace CsvCount
 {
+    // Viewing CSV files. Has lazy parsing especially for handling large files. 
     class Program
     {
+        enum DisplayMode
+        {
+            // Output to a CSV. Used to apply a filter to produce a smaller CSV. 
+            Csv,
+
+            // Show a single column. 
+            Vertical,
+
+            // show summary stats on the file 
+            Stats,
+        }
+
         static void Main(string[] args)
         {
-            if (args.Length == 0)
+            if (args.Length == 0 || args[0] == "-help" || args[0] == "-?")
             {
                 Console.WriteLine(
 @"Usage:
   CsvCount 
 
-    %filename%  :  prints first few rows of filename. 
-
-    %filename% -vertical  :  prints vert
-
-    %filename% -vertical -required A,B,C  -where Column=Value
-
 Used for viewing large CSV files.
-Prints the first row of data in the CSV file and counts the total # of rows.
+
+    %filename%  [options]
+        prints first few rows of filename. 
+
+    %filename% -vertical  [options]
+        prints a single column in vertical 
+
+    %filename% -stats 
+        print summary statistics about file 
+
+Options include:
+    -required A,B,C     : filter to require values for columns A,B,c
+    -where Column=Value : filter on value. Can have multiple filters. 
+    -take N             : only include first N rows that match the filter.
+    -select A,B,C       : only include columns A,B,C
+
+    -out <outfile>      : write resulting CSV to outfile
 ");
                 return;
             }
 
+            View view = new View();
             IList<IRowFilter> filters = new List<IRowFilter>();
+
+            string outputFile = null;
 
             string file = args[0];
 
-            bool vertical = false;
+            DisplayMode mode = DisplayMode.Csv; // default
 
             for (int i = 1; i < args.Length; i++)
             {
+                if (args[i] == "-out")
+                {
+                    outputFile = args[i + 1];
+                    i++;
+                    continue;
+                }
+                if (args[i] == "-stats")
+                {
+                    mode = DisplayMode.Stats;
+                    continue;
+                }
                 if (args[i] == "-vertical")
                 {
-                    vertical = true;
+                    mode = DisplayMode.Vertical;
+                    continue;
+                }
+                if (args[i] == "-take")
+                {
+                    int num = int.Parse(args[i + 1]);
+                    view.Take = num;
+                    i++;
+                    continue;
+                }
+                if (args[i] == "-select")
+                {
+                    var val = args[i + 1];
+                    view.Select = val.Split(',');
+                    i++;
                     continue;
                 }
                 if (args[i] == "-required" || args[i] == "-req")
@@ -56,59 +107,109 @@ Prints the first row of data in the CSV file and counts the total # of rows.
                     var clause = args[i + 1];
                     var parts = clause.Split('=');
                     string columnName = parts[0];
+                    
                     string value = parts[1];
 
                     filters.Add(new WhereFilter(columnName, value));
                     i++;
                     continue;
                 }
+                throw new InvalidOperationException("Unrecognized argument: " + args[i]);
             }
 
-            if (!vertical)
+            if (filters.Count > 0)
             {
-                PrintFastSummary(file);
+                view.Filters = filters.ToArray();
             }
-            else
+
+            TextWriter tw = null;
+            if (outputFile != null)
             {
-                PreviewVertical(file, filters);
+                tw = new StreamWriter(outputFile);
             }
+
+            TextWriter twOutput = (tw ?? Console.Out);
+
+            switch (mode)
+            {
+                case DisplayMode.Csv:
+                    ApplyFilter(file, view, twOutput);                
+                    break;
+                case DisplayMode.Vertical:
+                    if (view.Take.HasValue)
+                    {
+                        throw new InvalidOperationException("-vertical only shows 1 row. Can't use with -take switch.");
+                    }
+                    PreviewVertical(file, view);
+                    break;
+
+                case DisplayMode.Stats:
+                    if (view.Take.HasValue || view.Select != null || view.Filters != null)
+                    {
+                        throw new InvalidOperationException("unsupported command line switches for -stats.");
+                    }
+                    GetStats(file, twOutput);
+                    break;
+            }
+          
+
+            if (tw != null)
+            {
+                tw.Close();
+                tw.Dispose();
+            }
+        }
+
+
+        class HistRow
+        {
+            public int Count { get; set; }
+        }
+
+        static void GetStats(string file, TextWriter output)
+        {
+            int totalRows = GetTotalRows(file) - 1;
+
+            var dt = DataTable.New.ReadLazy(file);
+
+            int columnCounts = dt.ColumnNames.Count();
+
+            Console.WriteLine("Getting stats. File has {0} rows x {1} columns.", totalRows, columnCounts);
+            Console.WriteLine("(if this takes too long, use -select / -where / -take to shrink the data.");
+
+            var dtCounts = dt.GetColumnValueCounts(0);
+            dtCounts.CreateColumns<HistRow>(row => string.Format("{0}%", (row.Count * 100.0 / totalRows)));
+            dtCounts.RenameColumn("value", "PercentUnique");
+
+            dtCounts.SaveToStream(output);
         }
 
         // Provide a "vertical" view where each column is on its own line.
         // This is easier to pick out individual values. 
-        static void PreviewVertical(string file, IList<IRowFilter> filters = null)
+        static void PreviewVertical(string file, View view)
         {            
             var dt = DataTable.New.ReadLazy(file);
+
+            var selectIndices = new HashSet<int>(view.GetSelectedIndices(dt));
+            
                         
             var columns = dt.ColumnNames.ToArray();
             Console.WriteLine("[{0} columns]", columns.Length);
 
             foreach (var row in dt.Rows)
             {
-                if (filters != null)
+                if (!view.IsRowIncluded(row))
                 {
-                    bool skip = false;
-                    // Ensure all columns are present
-                    foreach (var filter in filters)
-                    {
-                        bool include = filter.IsValid(row);
-
-                        if (!include)
-                        {
-                            skip = true;
-                            break;
-                        }                        
-                    }
-                    if (skip)
-                    {
-                        continue;
-                    }
-                }
+                    continue;
+                }            
 
                 for(int i = 0; i < columns.Length; i++)
                 {
-                    string value = row.Values[i];
-                    Console.WriteLine("{0}: {1}", columns[i], value);
+                    if (selectIndices.Contains(i))
+                    {
+                        string value = row.Values[i];
+                        Console.WriteLine("{0}: {1}", columns[i], value);
+                    }
                 }
 
                 // Stop after first. 
@@ -117,12 +218,98 @@ Prints the first row of data in the CSV file and counts the total # of rows.
         }
 
 
+        // Apply filter to produce a new CSV
+        // If the filter can skip parsing, then fallback to a fast path. 
+        // Slower since it needs parsing         
+        static void ApplyFilter(string file, View view, TextWriter output)
+        {         
+            if (view.Select == null && view.Filters == null)
+            {
+                PrintFastSummary(file, view.Take, output);
+                return;
+            }
+
+            var dt = DataTable.New.ReadLazy(file);                        
+
+            var selectIndices = new HashSet<int>(view.GetSelectedIndices(dt));
+                     
+            var columns = dt.ColumnNames.ToArray();
+
+            // Write headers 
+            bool first = true;
+            for (int i = 0; i < columns.Length; i++)
+            {
+                if (selectIndices.Contains(i))
+                {
+                    if (!first)
+                    {
+                        output.Write(",");
+                    }
+                    first =false;
+                    output.Write(columns[i]);
+                }
+            }
+            output.WriteLine();
+
+            // Filter on rows. 
+            int skipped = 0;
+            int rowCount = 0;
+            bool stoppedEarly = false; 
+            foreach (var row in dt.Rows)
+            {
+                if (!view.IsRowIncluded(row))
+                {
+                    skipped++;
+                    continue;
+                }
+
+                first = true;
+                for (int i = 0; i < columns.Length; i++)
+                {
+                    if (selectIndices.Contains(i))
+                    {
+                        if (!first)
+                        {
+                            output.Write(",");
+                        }
+                        first = false;
+                        string value = row.Values[i];
+                        output.Write(EscapeCsvCell(value));                        
+                    }
+                }
+                output.WriteLine();
+
+                rowCount++;
+                if (view.Take.HasValue && rowCount >= view.Take.Value)
+                {
+                    stoppedEarly = true;
+                    Console.WriteLine("[stopping after {0} rows. Use -take to specify more.]", rowCount);
+                    break;                    
+                }
+            }
+
+            if (!stoppedEarly)
+            {
+                Console.WriteLine("[File has {0} rows]", rowCount);
+            }
+
+            if (view.Filters != null)
+            {
+                Console.WriteLine("[Where clause skipped {0} rows.]", skipped);
+            }
+        }
+
+
         // Print naive summary 
-        // No pasring, so very fast. Good for getting a quick count on large files. 
-        static void PrintFastSummary(string file)
+        // No parsing, so very fast. Good for getting a quick count on large files. 
+        static void PrintFastSummary(string file, int? take, TextWriter output)
         {
             // Use StreamReader since it skips parsing and is blazing fast. 
             int N = 5;
+            if (take.HasValue)
+            {
+                N = take.Value;
+            }
             int totalRows = 0;
             using (var tr = new StreamReader(file))
             {
@@ -137,7 +324,7 @@ Prints the first row of data in the CSV file and counts the total # of rows.
                     totalRows++;
                     if (totalRows < N)
                     {
-                        Console.WriteLine(line);
+                        output.WriteLine(line);
                     }
 
                     if (totalRows % 500000 == 0)
@@ -148,6 +335,38 @@ Prints the first row of data in the CSV file and counts the total # of rows.
             }
             Console.WriteLine();
             Console.WriteLine("Total rows: {0:n0}", totalRows);
+        }
+
+        // Quickly count total rows. No parsing
+        private static int GetTotalRows(string filename)
+        {
+            int count = 0;
+            using (var tr = new StreamReader(filename))
+            {
+                while (true)
+                {
+                    if (tr.ReadLine() == null)
+                    {
+                        return count;
+                    }
+                    count++;
+                }
+            }
+        }
+
+        // $$$ Escape this if it has commas?
+        public static string EscapeCsvCell(string s)
+        {
+            if (s == null)
+            {
+                return "";
+            }
+            s = s.Replace('\"', '\'');
+            if (s.Contains(","))
+            {
+                return '\"' + s + '\"';
+            }
+            return s;
         }
     }
 }

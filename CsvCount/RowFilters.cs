@@ -10,7 +10,10 @@ namespace CsvCount
 {
     interface IRowFilter
     {
+        // Is the current row included in the filter?
         bool IsValid(Row row);
+
+        
     }
 
     // Row must have non-empty values for all the specified columns
