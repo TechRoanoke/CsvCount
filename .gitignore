@@ -4,3 +4,4 @@ release
 obj
 *.suo
 packages
+*.user

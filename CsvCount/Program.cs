@@ -21,6 +21,9 @@ namespace CsvCount
 
             // show summary stats on the file 
             Stats,
+
+            // Historgram 
+            Hist,
         }
 
         static void Main(string[] args)
@@ -33,14 +36,32 @@ namespace CsvCount
 
 Used for viewing large CSV files.
 
+    -diff %File1% %File2% PrimaryKey C1,C2,C3..
+        diff 2 CSV files. This is symetric. 
+
     %filename%  [options]
         prints first few rows of filename. 
+    
+    %filename% -rename Src Dest
+        rename a single column. Combine with -out. 
+
+    %filename% -addHeader c1,c2,c3
+        adds a header row to the file
+
+    %filename% -replaceHeader c1,c2,c3
+        revmove the previos header and add the new one. 
+
+    %filename% -deleteHeader
+        delete the first row (a header)
 
     %filename% -vertical  [options]
         prints a single column in vertical 
 
     %filename% -stats 
         print summary statistics about file 
+
+    %filename% -hist [column]
+        print a histogram for the given column 
 
 Options include:
     -required A,B,C     : filter to require values for columns A,B,c
@@ -53,6 +74,17 @@ Options include:
                 return;
             }
 
+            if (args[0] == "-diff")
+            {
+                string file1 = args[1];
+                string file2 = args[2];
+                string primaryKeyColumnName = args[3];
+                string[] columnNames = args[4].Split(',');
+
+                CsvDiff.Diff(file1, file2, primaryKeyColumnName, columnNames);
+                return;
+            }
+
             View view = new View();
             IList<IRowFilter> filters = new List<IRowFilter>();
 
@@ -62,8 +94,45 @@ Options include:
 
             DisplayMode mode = DisplayMode.Csv; // default
 
+
+            string renameSrc = null;
+            string renameDest = null;
+            string histColumn = null;
+
+            bool adjustHeader = false;
+            string addHeader = null;
+            bool fDeleteHeader = false;
+
             for (int i = 1; i < args.Length; i++)
             {
+                if (args[i] == "-replaceHeader")
+                {
+                    adjustHeader = true;
+                    fDeleteHeader = true;
+                    addHeader = args[i + 1];
+                    i++;
+                    continue;
+                }
+                if (args[i] == "-deleteHeader")
+                {
+                    adjustHeader = true;
+                    fDeleteHeader = true;
+                    continue;
+                }
+                if (args[i] == "-addHeader")
+                {
+                    adjustHeader = true;
+                    addHeader = args[i + 1];
+                    i++;
+                    continue;
+                }
+                if (args[i] == "-rename")
+                {
+                    renameSrc = args[i+1];
+                    renameDest = args[i + 2];
+                    i+=2 ;
+                    continue;
+                }
                 if (args[i] == "-out")
                 {
                     outputFile = args[i + 1];
@@ -78,6 +147,13 @@ Options include:
                 if (args[i] == "-vertical")
                 {
                     mode = DisplayMode.Vertical;
+                    continue;
+                }
+                if (args[i] == "-hist")
+                {
+                    mode = DisplayMode.Hist;
+                    histColumn = args[i+1];
+                    i++;
                     continue;
                 }
                 if (args[i] == "-take")
@@ -116,7 +192,7 @@ Options include:
                 }
                 throw new InvalidOperationException("Unrecognized argument: " + args[i]);
             }
-
+                   
             if (filters.Count > 0)
             {
                 view.Filters = filters.ToArray();
@@ -130,26 +206,49 @@ Options include:
 
             TextWriter twOutput = (tw ?? Console.Out);
 
-            switch (mode)
+            if (adjustHeader)
             {
-                case DisplayMode.Csv:
-                    ApplyFilter(file, view, twOutput);                
-                    break;
-                case DisplayMode.Vertical:
-                    if (view.Take.HasValue)
-                    {
-                        throw new InvalidOperationException("-vertical only shows 1 row. Can't use with -take switch.");
-                    }
-                    PreviewVertical(file, view);
-                    break;
+                // Add a header row
+                // Do a rename 
+                AdjustHeader(file, addHeader, fDeleteHeader, twOutput);
+            }
+            else if (renameSrc != null)
+            {
+                // Do a rename 
+                Rename(file, renameSrc, renameDest, twOutput);
+            }
+            else
+            {
+                switch (mode)
+                {
+                    case DisplayMode.Csv:
+                        ApplyFilter(file, view, twOutput);
+                        break;
+                    case DisplayMode.Vertical:
+                        if (view.Take.HasValue)
+                        {
+                            throw new InvalidOperationException("-vertical only shows 1 row. Can't use with -take switch.");
+                        }
+                        PreviewVertical(file, view);
+                        break;
 
-                case DisplayMode.Stats:
-                    if (view.Take.HasValue || view.Select != null || view.Filters != null)
-                    {
-                        throw new InvalidOperationException("unsupported command line switches for -stats.");
-                    }
-                    GetStats(file, twOutput);
-                    break;
+                    case DisplayMode.Stats:
+                        if (view.Take.HasValue || view.Select != null || view.Filters != null)
+                        {
+                            throw new InvalidOperationException("unsupported command line switches for -stats.");
+                        }
+                        GetStats(file, twOutput);
+                        break;
+
+                    case DisplayMode.Hist:
+                        if (view.Take.HasValue || view.Select != null || view.Filters != null)
+                        {
+                            throw new InvalidOperationException("unsupported command line switches for -stats.");
+                        }
+                        ShowHist(file, histColumn);
+                        break;
+
+                }
             }
           
 
@@ -157,6 +256,123 @@ Options include:
             {
                 tw.Close();
                 tw.Dispose();
+            }
+        }
+
+        // Handles adding a header row, removing a row; and changing the header 
+        private static void AdjustHeader(
+            string file, 
+            string newHeaderRow, 
+            bool removeHeader,
+            TextWriter twOutput)
+        {
+            int totalRows = 0;
+            using (var tr = new StreamReader(file))
+            {
+                //twOutput.WriteLine(addHeader);
+
+                while (true)
+                {
+                    var line = tr.ReadLine();
+                    if (line == null)
+                    {
+                        break;
+                    }
+
+                    if (newHeaderRow != null)
+                    {
+                        // adjust delimiter to match rest of file.
+                        if (line.Contains("\t"))
+                        {
+                            newHeaderRow = newHeaderRow.Replace(',', '\t');
+                        }
+                        twOutput.WriteLine(newHeaderRow);
+                        newHeaderRow = null;
+                    }
+
+                    totalRows++;
+
+                    if (!removeHeader)
+                    {
+                        twOutput.WriteLine(line);
+                    }
+                    removeHeader = false;
+                    if (totalRows % 500000 == 0)
+                    {
+                        Console.Write(".");
+                    }
+                }
+            }
+        }
+
+        // Display a histogram 
+        private static void ShowHist(string file, string histColumn)
+        {
+            Dictionary<string, int> counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+            var dt = DataTable.New.ReadLazy(file);
+            int idx = dt.GetColumnIndex(histColumn);
+            int total = 0;
+            foreach (var row in dt.Rows)
+            {
+                total++;
+                var value = row.Values[idx];
+                int c;
+                counts.TryGetValue(value, out c);
+                c++;
+                counts[value] = c;
+            }            
+
+            // Show final 
+            Console.WriteLine("Histogram on column '{0}'", histColumn);
+            foreach (var kv in counts)
+            {
+                Console.WriteLine("{0}, {1}, {2}%", kv.Key, kv.Value, (kv.Value * 100 / total));
+            }
+        }
+
+        private static void Rename(string file, string renameSrc, string renameDest, TextWriter output)
+        {
+            Console.WriteLine("Renaming {0}-->{1}", renameSrc, renameDest);
+
+            int totalRows = 0;
+            using (var tr = new StreamReader(file))
+            {
+                string header = tr.ReadLine();
+                // Apply renames 
+                var headerNames = header.Split(',');
+                var newHeaderNames = Array.ConvertAll(headerNames, x =>
+                    {
+                        // strip quotes 
+                        if (x[0] == '\"')
+                        {
+                            x = x.Substring(1, x.Length - 2);
+                        }
+                        if (string.Equals(x, renameSrc, StringComparison.OrdinalIgnoreCase))
+                        {
+                            return renameDest;
+                        }
+                        return x;
+                    });
+                
+                output.WriteLine(string.Join(",", newHeaderNames));
+
+                string line;
+                while (true)
+                {
+                    line = tr.ReadLine();
+                    if (line == null)
+                    {
+                        break;
+                    }
+                    totalRows++;
+                    output.WriteLine(line);                   
+
+                    if (totalRows % 500000 == 0)
+                    {
+                        Console.Write(".");
+                    }
+                }
             }
         }
 
